@@ -28,7 +28,7 @@ class BlockingQueue {
             throw -1;
         }
         while (_queue.size() >= _maxSize) {
-            can_produce.wait_for(l, chrono::seconds(1)); // Is a max wait time necessary or is this an issue that can be fixed?
+            can_produce.wait(l);
         }
         _queue.push(item);
         can_consume.notify_one();
@@ -42,7 +42,7 @@ class BlockingQueue {
             if (_shutdown) {
                 return nullopt;
             }
-            can_consume.wait_for(l, chrono::seconds(1)); // Same question as above.
+            can_consume.wait(l); 
         }
         T value = _queue.front();
         _queue.pop();
@@ -53,6 +53,7 @@ class BlockingQueue {
     void shutdown() {
         unique_lock<mutex> l(lock);
         _shutdown = true;
+        can_consume.notify_all(); // Wake all consumers so they recognize to drain the queue.
     }
 };
 
@@ -79,8 +80,8 @@ void consumer(BlockingQueue<int>& queue, atomic<int>& sum) {
 int main() {
     BlockingQueue<int> queue(10);
     atomic<int> sum = 0;
-    const int PRODUCERS = 3;
-    const int CONSUMERS = 2;
+    const int PRODUCERS = 100;
+    const int CONSUMERS = 100;
 
     vector<thread> producers;
     for(int i=0; i<PRODUCERS; i++) {
