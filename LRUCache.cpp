@@ -35,7 +35,7 @@ class LRUCache {
     void put(K key, V value) {
         Node<K,V>* node;
         if (hash.find(key) == hash.end()) {
-            if (leastRecent->key.has_value()) {
+            if (leastRecent->key) {
                 hash.erase(leastRecent->key.value());
             }
             node = leastRecent;
