@@ -1,0 +1,3 @@
+target : dep dep2 dep3
+dep: build compile test
+dep2: npm
