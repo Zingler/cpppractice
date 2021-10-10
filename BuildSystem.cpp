@@ -1,7 +1,13 @@
+#include <algorithm>
 #include <fstream>
 #include <iostream>
-#include <vector>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <vector>
+#include <thread>
+#include <condition_variable>
 
 using namespace std;
 
@@ -66,7 +72,7 @@ bool isNum(char c) { return c >= '0' && c <= '9'; }
 bool isAlphaNum(char c) { return isAlpha(c) || isNum(c); }
 
 Token Lexer::get_token() {
-    if(_end) return Token::ENDFILE;
+    if (_end) return Token::ENDFILE;
 
     std::istream& input = *p_input;
     buffer.clear();
@@ -108,7 +114,8 @@ class Parser {
     string consume(Token t) {
         auto actual = lex->token();
         if (t != actual) {
-            cout << "Expected token of type " << TokenName[t] << " but got " << TokenName[actual] << endl;
+            cout << "Expected token of type " << TokenName[t] << " but got "
+                 << TokenName[actual] << endl;
             throw -1;
         }
         auto value = lex->text();
@@ -138,7 +145,7 @@ void Parser::buildDescriptionList() {
 }
 
 void Parser::buildDescriptionLine() {
-    if(lex->token() == Token::ENDLINE) {
+    if (lex->token() == Token::ENDLINE) {
         lex->advance();
         return;
     }
@@ -160,11 +167,88 @@ vector<string> Parser::parseDeps() {
     return result;
 }
 
+class TaskExecutor {
+   public:
+    TaskExecutor(map<string, vector<string>> taskDefs, size_t threadCount)
+        : taskDefs(taskDefs), threadCount(threadCount) {}
+
+    void run() {
+        populateReadyTasks();
+        vector<thread> threads;
+        for (int i = 0; i < threadCount; i++) {
+            threads.push_back(thread([this, i]() { runner(i); }));
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+    }
+
+    map<string, vector<string>> taskDefs;
+    size_t threadCount;
+
+    map<string, bool> complete;
+    map<string, bool> inprogress;
+    size_t complete_tasks = 0;
+    set<string> readyTasks;
+    condition_variable cv;
+    mutex mutex;
+    bool finished;
+
+    optional<string> getTask() {
+        unique_lock l(mutex);
+        while (readyTasks.size() == 0 && !finished) {
+            cv.wait(l);
+        }
+        if (readyTasks.size() > 0) {
+            auto pointer = readyTasks.begin();
+            string result = *pointer;
+            readyTasks.erase(pointer);
+            inprogress[result] = true;
+            return result;
+        } else {
+            return nullopt;
+        }
+    }
+
+    void completeTask(string task) {
+        unique_lock l(mutex);
+        complete[task] = true;
+        complete_tasks++;
+        populateReadyTasks();
+        if (complete_tasks == taskDefs.size()) {
+            finished = true;
+            cv.notify_all();
+        } else {
+            cv.notify_one();
+        }
+    }
+
+    void populateReadyTasks() {
+        for (const auto& [target, deps] : taskDefs) {
+            bool ready =
+                std::all_of(deps.cbegin(), deps.cend(),
+                            [this](const string& x) { return complete[x]; });
+            if (ready && !complete[target] && !inprogress[target]) {
+                readyTasks.insert(target);
+            }
+        }
+    }
+
+    void runner(int threadNum) {
+        while (auto task = getTask()) {
+            printf("Thread %d: Executing %s\n", threadNum, (*task).c_str());
+            this_thread::sleep_for(chrono::seconds(3));
+
+            completeTask(*task);
+            printf("Thread %d: Finished  %s\n", threadNum, (*task).c_str());
+        }
+    }
+};
+
 int main() {
     ifstream build("build.txt");
     Parser p;
     map<string, vector<string>> targets = p(build);
-    for(const auto& entry: targets) {
-        cout << entry.first << endl;
-    }
+    TaskExecutor ex(targets, 100);
+    ex.run();
 }
