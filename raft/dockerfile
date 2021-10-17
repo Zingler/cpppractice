@@ -1,0 +1,8 @@
+FROM ubuntu:latest
+WORKDIR /user/src/app
+run apt update
+run apt install -y python3.8 pip
+RUN pip install requests flask
+COPY . .
+CMD ["-u", "server.py"]
+ENTRYPOINT ["python3"]
