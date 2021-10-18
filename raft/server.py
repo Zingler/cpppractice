@@ -46,7 +46,7 @@ class CState:
         self.last_event = datetime.now()
         self.vote = None
         self.log = [LogEntry(-10, "Initialize")]
-        self.commit_index = 1
+        self.commit_index = 0
         self.last_applied = 1
         self.leaderId = None
 
@@ -70,8 +70,8 @@ class CState:
     def becomeLeader(self, term):
         self.leader_term = self.term
         self.state = State.LEADER
-        self.nextIndex = [len(self.log) for x in servers]
-        self.matchIndex = [0 for x in servers]
+        self.nextIndex = {x: len(self.log) for x in servers}
+        self.matchIndex = {x: 0 for x in servers}
     def becomeCandidate(self):
         self.state = State.CANDIDATE
     
@@ -89,31 +89,54 @@ class CState:
     
     def leader(self, leader_term):
         print(f'Sending leader hearbeats for term {leader_term}')
-        self.unlock()
         start = datetime.now()
+
         for server in servers:
             if(server == me):
                 continue
-            try:
-                data = {
-                    'term':leader_term,
-                    'leader':me,
-                    'entries': [],
-                    'prevLogIndex': 0,
-                    'prevLogTerm': -10,
-                    'leaderCommit': 0,
-                    }
-                response = http.post(f'http://{server}:5000/appendEntries', json=data, timeout=1)
-                r_term = response['term']
-                if(response['term'] > leader_term):
-                    with cstate:
-                        cstate.becomeFollower(r_term)
-                    return
-            except Exception as e:
-                pass
+            self.sendUpdates(server, leader_term)
+        self.updateCommitIndex()
+        self.unlock()
+
         wait_time = (term_timeout/4) - (datetime.now() - start).seconds 
         if(wait_time > 0):
             time.sleep(wait_time)
+
+    def sendUpdates(self, server, leader_term):
+        data = {
+            'term': self.leader_term,
+            'leader':me,
+            'entries': [x._asdict() for x in self.log[self.nextIndex[server]:]],
+            'prevLogIndex': self.nextIndex[server]-1,
+            'prevLogTerm': self.log[self.nextIndex[server]-1].term,
+            'leaderCommit': self.commit_index,
+            }
+        try:
+            response = http.post(f'http://{server}:5000/appendEntries', json=data, timeout=1).json()
+            if(response['success']):
+                self.nextIndex[server] = len(self.log)
+                self.matchIndex[server] = len(self.log)
+            else:
+                self.nextIndex[server] -= 1
+                print(f"Failed to update log for {server}. Decremented nextIndex to {self.nextIndex[server]}.")
+
+            r_term = response['term']
+            if(response['term'] > leader_term):
+                self.becomeFollower(r_term)
+        except Exception as e:
+            print(f"Failed to connect to {server} to append entries. Continuing on.", e)
+
+    def updateCommitIndex(self):
+        new_commit = len(self.log)-1
+        threshold = (len(servers) // 2) + 1
+        while new_commit > self.commit_index:
+            if self.log[new_commit].term == self.term and \
+                sum((self.matchIndex[s] >= new_commit for s in servers)) >= threshold:
+                self.commit_index = new_commit
+                print(f"Updating leader commit index to {self.commit_index} log line {self.log[self.commit_index].log}")
+                return
+
+            new_commit -= 1
 
     def candidate(self):
         self.term += 1
@@ -152,6 +175,7 @@ cstate = CState()
 def machine():
     while True:
         cstate.lock()
+        print(f"Commited : {cstate.commit_index}. Log length: {len(cstate.log)}")
         if(cstate.state == State.FOLLOWER):
             cstate.follower()
         elif(cstate.state == State.CANDIDATE):
@@ -223,21 +247,24 @@ def appendEntries():
     with cstate:
         if(request_term > cstate.term):
             cstate.becomeFollower(request_term)
+            cstate.updateEvent()
 
         if(request_term < cstate.term):
-            return {'success':False, 'term': cstate.term}
-        if(prevLogIndex >= len(cstate.log) or cstate.log[prevLogIndex].term != prevLogTerm):
             return {'success':False, 'term': cstate.term}
         if(request_term == cstate.term):
             cstate.becomeFollower(request_term)
             cstate.updateEvent()
             cstate.leaderId = leader
             success = True
+        if(prevLogIndex >= len(cstate.log) or cstate.log[prevLogIndex].term != prevLogTerm):
+            cstate.updateEvent()
+            return {'success':False, 'term': cstate.term}
         
         updateLogs(cstate.log, prevLogIndex, entries)
 
         if(leaderCommit > cstate.commit_index):
-            cstate.commit_index = max(leaderCommit, len(cstate.log)-1)
+            cstate.commit_index = min(leaderCommit, len(cstate.log)-1)
+            print(f"Updating follower commit index to {cstate.commit_index} log line {cstate.log[cstate.commit_index].log}")
 
         return {'success': success, 'term': cstate.term}
 
@@ -266,6 +293,7 @@ def submit():
                 return {'success':False}
         
         cstate.log.append(LogEntry(cstate.term,log))
+        cstate.matchIndex[me] = len(log)-1
         print(f'Added log entry as leader {cstate.log[-1]}')
     return {'success': True}
         
