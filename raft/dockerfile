@@ -3,6 +3,7 @@ WORKDIR /user/src/app
 run apt update
 run apt install -y python3.8 pip
 RUN pip install requests flask
+RUN apt install -y iptables
 COPY . .
 CMD ["-u", "server.py"]
 ENTRYPOINT ["python3"]

@@ -65,7 +65,6 @@ class CState:
         if(term > self.term):
             self.term = term
             self.vote = None
-            self.updateEvent()
         self.state = State.FOLLOWER
     def becomeLeader(self, term):
         self.leader_term = self.term
@@ -175,7 +174,7 @@ cstate = CState()
 def machine():
     while True:
         cstate.lock()
-        print(f"Commited : {cstate.commit_index}. Log length: {len(cstate.log)}")
+        print(f"Commited : {cstate.commit_index}. Log length: {len(cstate.log)}. Term {cstate.term}.")
         if(cstate.state == State.FOLLOWER):
             cstate.follower()
         elif(cstate.state == State.CANDIDATE):
