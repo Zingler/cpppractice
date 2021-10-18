@@ -1,4 +1,5 @@
 from typing import ValuesView
+from typing import List
 from flask import Flask
 from flask import request
 from enum import Enum
@@ -12,23 +13,19 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import http
 import logging
+from collections import namedtuple
 
-#http.client.HTTPConnection.debuglevel = 1
-
-#logging.basicConfig()
-#logging.getLogger().setLevel(logging.DEBUG)
-#requests_log = logging.getLogger("requests.packages.urllib3")
-#requests_log.setLevel(logging.DEBUG)
-#requests_log.propagate = True
+LogEntry = namedtuple('LogEntry', ['term', 'log'])
 
 retry_strategy = Retry(total=1)
 adapter = HTTPAdapter(max_retries=retry_strategy)
 http = requests.Session()
 http.mount("http://", adapter)
 
-servers = ['server1', 'server2', 'server3']
+servers = ['10.0.0.3', '10.0.0.4', '10.0.0.5']
 # servers = ['server1']
-me = os.getenv('NAME') or 'server1'
+me = os.getenv('NAME') or '10.0.0.3'
+print(f'My name is {me}')
 
 term_timeout = 20
 
@@ -48,6 +45,10 @@ class CState:
         self.mutex = threading.RLock()
         self.last_event = datetime.now()
         self.vote = None
+        self.log = [LogEntry(-10, "Initialize")]
+        self.commit_index = 1
+        self.last_applied = 1
+        self.leaderId = None
 
     def __enter__(self):
         self.mutex.acquire()
@@ -69,6 +70,8 @@ class CState:
     def becomeLeader(self, term):
         self.leader_term = self.term
         self.state = State.LEADER
+        self.nextIndex = [len(self.log) for x in servers]
+        self.matchIndex = [0 for x in servers]
     def becomeCandidate(self):
         self.state = State.CANDIDATE
     
@@ -92,7 +95,15 @@ class CState:
             if(server == me):
                 continue
             try:
-                response = http.post(f'http://{server}:5000/appendEntries', json={'term':leader_term,'leader':me}, timeout=1)
+                data = {
+                    'term':leader_term,
+                    'leader':me,
+                    'entries': [],
+                    'prevLogIndex': 0,
+                    'prevLogTerm': -10,
+                    'leaderCommit': 0,
+                    }
+                response = http.post(f'http://{server}:5000/appendEntries', json=data, timeout=1)
                 r_term = response['term']
                 if(response['term'] > leader_term):
                     with cstate:
@@ -111,13 +122,15 @@ class CState:
         self.updateEvent()
         self.vote = me 
         vote_count = 1
+        last_log_index = len(self.log)-1
+        last_log_term = self.log[last_log_index].term
         random.shuffle(servers)
         self.unlock()
 
         for server in servers:
             if(server == me):
                 continue
-            response = collectVote(server,candidate_term)
+            response = collectVote(server,candidate_term, last_log_index, last_log_term)
             r_term = response['term']
             with cstate:
                 if(r_term > self.term):
@@ -147,9 +160,15 @@ def machine():
             cstate.leader(cstate.leader_term)
 
 
-def collectVote(server, term):
+def collectVote(server, term, last_log_index, last_log_term):
     try:
-        response = http.post(f'http://{server}:5000/requestVote', json={'term':term,'candidate':me}, timeout=1)
+        data = {
+            'term':term,
+            'candidate':me,
+            'lastLogIndex':last_log_index,
+            'lastLogTerm':last_log_term,
+        }
+        response = http.post(f'http://{server}:5000/requestVote', json=data, timeout=1)
         return response.json()
     except Exception as e:
         print(f"Exception getting vote from {server}")
@@ -160,6 +179,8 @@ def requestVote():
     data = request.get_json(force=True)
     request_term = data['term']
     request_candidate = data['candidate']
+    last_log_index = data['lastLogIndex']
+    last_log_term = data['lastLogTerm']
 
     print(f"Recieved request vote from {request_candidate} for term {request_term}")
 
@@ -169,7 +190,15 @@ def requestVote():
             cstate.becomeFollower(request_term)
 
         grant = False
-        if cstate.term == request_term and (cstate.vote == None or cstate.vote == request_candidate):
+
+        larger_term = last_log_term > cstate.log[-1].term 
+        equal_term = last_log_term == cstate.log[-1].term 
+        longer_log = last_log_index >= len(cstate.log)-1
+        log_is_newer = larger_term or (equal_term and longer_log)
+
+        if cstate.term == request_term \
+            and (cstate.vote == None or cstate.vote == request_candidate) \
+            and log_is_newer: 
             cstate.vote = request_candidate
             cstate.updateEvent()
             grant = True
@@ -184,19 +213,62 @@ def requestVote():
 def appendEntries():
     data = request.get_json(force=True)
     request_term = data['term']
-    request_candidate = data['leader']
+    leader = data['leader']
+    prevLogIndex = data['prevLogIndex']
+    prevLogTerm = data['prevLogTerm']
+    entries = [LogEntry(**x) for x in data['entries']]
+    leaderCommit = data['leaderCommit']
 
     success = False
     with cstate:
         if(request_term > cstate.term):
             cstate.becomeFollower(request_term)
 
+        if(request_term < cstate.term):
+            return {'success':False, 'term': cstate.term}
+        if(prevLogIndex >= len(cstate.log) or cstate.log[prevLogIndex].term != prevLogTerm):
+            return {'success':False, 'term': cstate.term}
         if(request_term == cstate.term):
             cstate.becomeFollower(request_term)
             cstate.updateEvent()
+            cstate.leaderId = leader
             success = True
+        
+        updateLogs(cstate.log, prevLogIndex, entries)
+
+        if(leaderCommit > cstate.commit_index):
+            cstate.commit_index = max(leaderCommit, len(cstate.log)-1)
+
         return {'success': success, 'term': cstate.term}
 
+def updateLogs(log: List[LogEntry], prevLogIndex, entries):
+    i = prevLogIndex
+    for e in entries:
+        i+=1
+        if i<len(log):
+            if log[i].term != e.term:
+                del log[i:]
+                log.append(e)
+        else:
+            log.append(e)
+
+
+@app.route('/submit', methods=["POST"])
+def submit():
+    data = request.get_json(force=True)
+    log = data['log']
+    with cstate:
+        if cstate.state != State.LEADER:
+            if cstate.leaderId:
+                http.post(f"http://{cstate.leaderId}:5000/submit", json=data, timeout=1)
+                return {'success':True}
+            else:
+                return {'success':False}
+        
+        cstate.log.append(LogEntry(cstate.term,log))
+        print(f'Added log entry as leader {cstate.log[-1]}')
+    return {'success': True}
+        
 
 if __name__ == '__main__':
     threading.Thread(target=machine).start()
